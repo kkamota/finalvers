@@ -90,6 +90,8 @@ class SubgramCheckMiddleware(BaseMiddleware):
             user_payload["is_premium"] = bool(is_premium)
         user_payload.update(extra_params)
 
+        user_payload.setdefault("action", "subscribe")
+
         response = await self._client.get_sponsors(
             user_id=user.id,
             chat_id=chat_id,
@@ -97,10 +99,16 @@ class SubgramCheckMiddleware(BaseMiddleware):
         )
 
         if response is None:
-            logging.warning(
-                "SubGram API returned no data for user_id=%s, allowing access", user.id
+            await self._send_blocking_message(
+                bot,
+                event,
+                chat_id,
+                (
+                    "Не удалось проверить выполнение заданий. "
+                    "Повторите попытку позже."
+                ),
             )
-            return await handler(event, data)
+            return None
 
         status = response.get("status")
         if status in self.BLOCKING_STATUSES:
@@ -111,7 +119,14 @@ class SubgramCheckMiddleware(BaseMiddleware):
 
         if status == "error":
             logging.warning("SubGram API responded with error: %s", response)
-            return await handler(event, data)
+            await self._send_blocking_message(
+                bot,
+                event,
+                chat_id,
+                response.get("message")
+                or "Ошибка при проверке заданий. Попробуйте еще раз позже.",
+            )
+            return None
 
         await db.set_flyer_verified(user.id, True)
 
@@ -135,19 +150,11 @@ class SubgramCheckMiddleware(BaseMiddleware):
     ) -> bool:
         prompt = self._build_blocking_prompt(response, status)
         if prompt is None:
-            return False
+            text = "Выполните обязательные задания, чтобы продолжить пользоваться ботом."
+            return await self._send_blocking_message(bot, event, chat_id, text)
 
         text, markup = prompt
-
-        if self._is_subgram_callback(event):
-            await self._acknowledge_callback(event)
-            await self._cleanup_callback_message(event)
-
-        try:
-            await bot.send_message(chat_id, text, reply_markup=markup)
-        except Exception:
-            logging.exception("Failed to send SubGram task prompt to chat_id=%s", chat_id)
-        return True
+        return await self._send_blocking_message(bot, event, chat_id, text, markup)
 
     async def _remember_user_context(
         self,
@@ -242,6 +249,24 @@ class SubgramCheckMiddleware(BaseMiddleware):
             return
         with suppress(TelegramBadRequest):
             await event.message.delete()
+
+    async def _send_blocking_message(
+        self,
+        bot: Any,
+        event: TelegramObject,
+        chat_id: int,
+        text: str,
+        markup: Optional[Any] = None,
+    ) -> bool:
+        if self._is_subgram_callback(event):
+            await self._acknowledge_callback(event)
+            await self._cleanup_callback_message(event)
+
+        try:
+            await bot.send_message(chat_id, text, reply_markup=markup)
+        except Exception:
+            logging.exception("Failed to send SubGram task prompt to chat_id=%s", chat_id)
+        return True
 
     def _build_blocking_prompt(
         self, response: Dict[str, Any], status: Optional[str]
