@@ -332,6 +332,12 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
     )
 
 
+@router.callback_query(F.data.startswith("subgram"))
+async def handle_subgram_callback(callback: CallbackQuery) -> None:
+    """Пустой обработчик, позволяющий корректно учитывать колбэки SubGram."""
+    return None
+
+
 @router.message(F.text == "💰 Баланс")
 async def show_balance(message: Message, settings: Settings, bot: Bot) -> None:
     user = await ensure_user(message, settings)
