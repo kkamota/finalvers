@@ -75,7 +75,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
         if was_verified and self._is_subgram_callback(event):
             await self._acknowledge_callback(event)
             await self._cleanup_callback_message(event)
-            return None
+            return await handler(event, data)
 
         await self._remember_user_context(user.id, username, referred_by, user_record)
 
@@ -108,7 +108,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
                     "Повторите попытку позже."
                 ),
             )
-            return None
+            return await self._maybe_call_subgram_handler(handler, event, data)
 
         status = response.get("status")
         if status in self.BLOCKING_STATUSES:
@@ -126,7 +126,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
                 response.get("message")
                 or "Ошибка при проверке заданий. Попробуйте еще раз позже.",
             )
-            return None
+            return await self._maybe_call_subgram_handler(handler, event, data)
 
         await db.set_flyer_verified(user.id, True)
 
@@ -136,7 +136,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
         if self._is_subgram_callback(event):
             await self._acknowledge_callback(event)
             await self._cleanup_callback_message(event)
-            return None
+            return await handler(event, data)
 
         return await handler(event, data)
 
@@ -249,6 +249,16 @@ class SubgramCheckMiddleware(BaseMiddleware):
             return
         with suppress(TelegramBadRequest):
             await event.message.delete()
+
+    async def _maybe_call_subgram_handler(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Any],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        if self._is_subgram_callback(event):
+            return await handler(event, data)
+        return None
 
     async def _send_blocking_message(
         self,
