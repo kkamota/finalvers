@@ -131,6 +131,23 @@ class SubgramCheckMiddleware(BaseMiddleware):
             status,
             response.get("message"),
         )
+        if response.get("code") == 404:
+            logger.warning(
+                "SubGram flagged potential fake account | user_id=%s chat_id=%s response=%s",
+                user.id,
+                chat_id,
+                response,
+            )
+            await self._send_blocking_message(
+                bot,
+                event,
+                chat_id,
+                (
+                    "К сожалению, мы не можем удостовериться, что ваш аккаунт не фейковый. "
+                    "Попробуйте позже."
+                ),
+            )
+            return await self._maybe_call_subgram_handler(handler, event, data)
         if status in self.BLOCKING_STATUSES:
             handled = await self._handle_blocking_status(bot, event, chat_id, response, status)
             if handled:
