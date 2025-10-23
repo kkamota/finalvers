@@ -332,6 +332,12 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot, settings
     )
 
 
+@router.callback_query(F.data.startswith("subgram"))
+async def handle_subgram_callback(callback: CallbackQuery) -> None:
+    """Пустой обработчик, позволяющий корректно учитывать колбэки SubGram."""
+    return None
+
+
 @router.message(F.text == "💰 Баланс")
 async def show_balance(message: Message, settings: Settings, bot: Bot) -> None:
     user = await ensure_user(message, settings)
@@ -348,6 +354,11 @@ async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
     if not await ensure_not_banned(message, user):
         return
     if not await ensure_subscription_access(message, bot, settings, user):
+        return
+    if not getattr(user, "flyer_verified", False):
+        await message.answer(
+            "Получить ежедневный бонус можно после выполнения заданий из SubGram."
+        )
         return
     now = datetime.datetime.utcnow()
     last_bonus = None
