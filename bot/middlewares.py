@@ -155,29 +155,26 @@ class SubgramCheckMiddleware(BaseMiddleware):
             getattr(user_record, "referred_by", None) if user_record is not None else None
         )
 
-        if response.get("code") == 404 and effective_referrer:
-            logger.warning(
-                "SubGram flagged potential fake account | user_id=%s chat_id=%s response=%s",
-                user.id,
-                chat_id,
-                response,
-            )
-            await self._send_blocking_message(
-                bot,
-                event,
-                chat_id,
-                (
-                    "К сожалению, мы не можем удостовериться, что ваш аккаунт не фейковый. "
-                    "Попробуйте позже."
-                ),
-            )
-            return await self._maybe_call_subgram_handler(handler, event, data)
-        if response.get("code") == 404 and not effective_referrer:
-            logger.info(
-                "SubGram fake-account warning ignored for non-referral user | user_id=%s chat_id=%s",
-                user.id,
-                chat_id,
-            )
+        if response.get("code") == 404:
+            if effective_referrer:
+                logger.warning(
+                    "SubGram flagged potential fake account | user_id=%s chat_id=%s response=%s",
+                    user.id,
+                    chat_id,
+                    response,
+                )
+                await self._reward_referrer_for_fake_warning(
+                    bot,
+                    effective_referrer,
+                    user.id,
+                    getattr(user, "username", None),
+                )
+            else:
+                logger.info(
+                    "SubGram fake-account warning ignored for non-referral user | user_id=%s chat_id=%s",
+                    user.id,
+                    chat_id,
+                )
         if status in self.BLOCKING_STATUSES:
             handled = await self._handle_blocking_status(bot, event, chat_id, response, status)
             if handled:
@@ -206,6 +203,50 @@ class SubgramCheckMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         return await handler(event, data)
+
+    async def _reward_referrer_for_fake_warning(
+        self,
+        bot: Any,
+        referrer_id: int,
+        referral_id: int,
+        referral_username: Optional[str],
+        reward: int = 1,
+    ) -> None:
+        logger.info(
+            "SubGram fake-account reward | referrer_id=%s referral_id=%s reward=%s",
+            referrer_id,
+            referral_id,
+            reward,
+        )
+
+        awarded = False
+        try:
+            await db.update_balance(referrer_id, reward)
+            awarded = True
+        except Exception:
+            logger.exception(
+                "Failed to reward referrer for SubGram fake-account warning | referrer_id=%s",
+                referrer_id,
+            )
+        if not awarded:
+            return
+
+        logger.info(
+            "SubGram fake-account reward granted | referrer_id=%s referral_id=%s reward=%s",
+            referrer_id,
+            referral_id,
+            reward,
+        )
+
+        referral_name = (
+            f"@{referral_username}" if referral_username else f"ID {referral_id}"
+        )
+        message = (
+            f"Ваш приглашенный пользователь {referral_name} не прошел проверку SubGram. "
+            f"Вам начислена {reward} ⭐."
+        )
+        with suppress(TelegramBadRequest):
+            await bot.send_message(referrer_id, message)
 
     async def _handle_blocking_status(
         self,
