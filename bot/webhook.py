@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Optional
 
 from aiogram import Bot
 from fastapi import FastAPI, Request
@@ -112,31 +112,40 @@ def _extract_username(payload: dict[str, Any]) -> Optional[str]:
 def create_app(bot: Bot, settings: Settings) -> FastAPI:
     app = FastAPI()
 
-    @app.post("/flyer_webhook")
-    async def flyer_webhook(request: Request) -> dict[str, bool]:
+    @app.post("/subgram_webhook")
+    async def subgram_webhook(request: Request) -> dict[str, bool]:
+        api_key = request.headers.get("Api-Key")
+        if api_key != settings.subgram_api_key:
+            logger.warning("Received webhook with invalid Api-Key")
+            return _SUCCESS_RESPONSE
+
         try:
             payload = await request.json()
         except Exception:
-            logger.exception("Received invalid JSON payload from Flyer")
+            logger.exception("Received invalid JSON payload from SubGram")
             return _SUCCESS_RESPONSE
 
-        event_type = payload.get("type")
-        if event_type == "test":
+        events = payload.get("webhooks")
+        if not isinstance(events, list):
+            logger.info("Webhook payload without events: %s", payload)
             return _SUCCESS_RESPONSE
 
-        telegram_id = _extract_telegram_id(payload)
-        if telegram_id is None:
-            logger.warning("Webhook event without telegram_id: %s", payload)
-            return _SUCCESS_RESPONSE
+        for event in events:
+            if not isinstance(event, dict):
+                continue
 
-        username = _extract_username(payload)
-        chat_id = _extract_chat_id(payload, telegram_id)
+            telegram_id = _coerce_int(event.get("user_id"))
+            if telegram_id is None:
+                logger.warning("SubGram webhook without user_id: %s", event)
+                continue
 
-        if event_type == "sub_completed":
-            user = await _ensure_user_record(telegram_id, username)
-            already_verified = bool(user and user.flyer_verified)
+            status = event.get("status")
+            username = event.get("username")
+            chat_id = telegram_id
 
-            await db.set_flyer_verified(telegram_id, True)
+            if status in {"subscribed", "notgetted"}:
+                user = await _ensure_user_record(telegram_id, username)
+                already_verified = bool(user and user.flyer_verified)
 
             if not already_verified:
 
@@ -155,18 +164,31 @@ def create_app(bot: Bot, settings: Settings) -> FastAPI:
                             telegram_id,
                         )
 
-                asyncio.create_task(_run_start())
+                if not already_verified:
 
-            return _SUCCESS_RESPONSE
+                    async def _run_start() -> None:
+                        try:
+                            await run_start_flow(
+                                bot,
+                                settings,
+                                telegram_id,
+                                chat_id,
+                                username,
+                            )
+                        except Exception:  # pragma: no cover - logging best effort
+                            logger.exception(
+                                "Failed to trigger /start flow for telegram_id=%s",
+                                telegram_id,
+                            )
 
-        if event_type == "new_status":
-            status = _extract_first(payload, (("data", "status"),))
-            if status == "abort":
+                    asyncio.create_task(_run_start())
+                continue
+
+            if status == "unsubscribed":
                 await db.set_flyer_verified(telegram_id, False)
-
                 user = await _ensure_user_record(telegram_id, username)
 
-                async def _handle_abort() -> None:
+                async def _handle_unsubscribe() -> None:
                     from .handlers import _handle_unsubscription
                     from .keyboards import subscribe_keyboard
 
@@ -194,11 +216,11 @@ def create_app(bot: Bot, settings: Settings) -> FastAPI:
                             telegram_id,
                         )
 
-                asyncio.create_task(_handle_abort())
+                asyncio.create_task(_handle_unsubscribe())
+                continue
 
-            return _SUCCESS_RESPONSE
+            logger.info("Unhandled SubGram webhook status: %s", status)
 
-        logger.info("Unhandled Flyer webhook event type: %s", event_type)
         return _SUCCESS_RESPONSE
 
     @app.post("/subgram_webhook")
