@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Dict, Optional
 
@@ -43,6 +44,13 @@ class SubgramClient:
         payload: Dict[str, Any] = {"user_id": user_id, "chat_id": chat_id}
         payload.update({key: value for key, value in kwargs.items() if value is not None})
 
+        logger.info(
+            "SubGram request prepared | user_id=%s chat_id=%s payload=%s",
+            user_id,
+            chat_id,
+            json.dumps(payload, ensure_ascii=False),
+        )
+
         headers = {"Auth": self.api_key}
         session = await self._get_session()
 
@@ -63,6 +71,13 @@ class SubgramClient:
                     )
                     return None
 
+                logger.info(
+                    "SubGram response received | user_id=%s chat_id=%s http_status=%s body=%s",
+                    user_id,
+                    chat_id,
+                    response.status,
+                    json.dumps(data, ensure_ascii=False),
+                )
                 if response.status >= 400:
                     logger.warning(
                         "SubGram API responded with HTTP %s: %s",

@@ -12,6 +12,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from .database import db
 from .subgram import SubgramClient
 
+logger = logging.getLogger(__name__)
+
 
 class ThrottlingMiddleware(BaseMiddleware):
     def __init__(self, rate_limit: float = 1.0) -> None:
@@ -66,6 +68,14 @@ class SubgramCheckMiddleware(BaseMiddleware):
         user_record = await db.get_user(user.id)
         was_verified = bool(user_record and getattr(user_record, "flyer_verified", 0))
 
+        logger.info(
+            "SubGram middleware invoked | user_id=%s chat_id=%s was_verified=%s is_callback=%s",
+            user.id,
+            chat_id,
+            was_verified,
+            self._is_subgram_callback(event),
+        )
+
         if was_verified and not self._is_subgram_callback(event):
             return await handler(event, data)
 
@@ -99,6 +109,9 @@ class SubgramCheckMiddleware(BaseMiddleware):
         )
 
         if response is None:
+            logger.warning(
+                "SubGram response missing | user_id=%s chat_id=%s", user.id, chat_id
+            )
             await self._send_blocking_message(
                 bot,
                 event,
@@ -111,6 +124,13 @@ class SubgramCheckMiddleware(BaseMiddleware):
             return await self._maybe_call_subgram_handler(handler, event, data)
 
         status = response.get("status")
+        logger.info(
+            "SubGram status resolved | user_id=%s chat_id=%s status=%s message=%s",
+            user.id,
+            chat_id,
+            status,
+            response.get("message"),
+        )
         if status in self.BLOCKING_STATUSES:
             handled = await self._handle_blocking_status(bot, event, chat_id, response, status)
             if handled:
@@ -118,7 +138,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
             status = "ok"
 
         if status == "error":
-            logging.warning("SubGram API responded with error: %s", response)
+            logger.warning("SubGram API responded with error: %s", response)
             await self._send_blocking_message(
                 bot,
                 event,
@@ -151,6 +171,11 @@ class SubgramCheckMiddleware(BaseMiddleware):
         prompt = self._build_blocking_prompt(response, status)
         if prompt is None:
             text = "Выполните обязательные задания, чтобы продолжить пользоваться ботом."
+            logger.warning(
+                "SubGram blocking status without prompt | status=%s response=%s",
+                status,
+                response,
+            )
             return await self._send_blocking_message(bot, event, chat_id, text)
 
         text, markup = prompt
@@ -164,10 +189,21 @@ class SubgramCheckMiddleware(BaseMiddleware):
         user_record: Optional[Any],
     ) -> None:
         if user_record is None:
+            logger.info(
+                "SubGram remember context | created user_id=%s referred_by=%s",
+                telegram_id,
+                referred_by,
+            )
             await db.create_user(telegram_id, 0, referred_by, username)
             return
 
         if username is not None and username != user_record.username:
+            logger.info(
+                "SubGram remember context | updating username user_id=%s old=%s new=%s",
+                telegram_id,
+                getattr(user_record, "username", None),
+                username,
+            )
             await db.update_username(telegram_id, username)
             with suppress(AttributeError):
                 user_record.username = username
@@ -177,6 +213,11 @@ class SubgramCheckMiddleware(BaseMiddleware):
             and referred_by != telegram_id
             and user_record.referred_by is None
         ):
+            logger.info(
+                "SubGram remember context | assigning referrer user_id=%s ref=%s",
+                telegram_id,
+                referred_by,
+            )
             await db.assign_referrer(telegram_id, referred_by)
             with suppress(AttributeError):
                 user_record.referred_by = referred_by
@@ -275,44 +316,21 @@ class SubgramCheckMiddleware(BaseMiddleware):
         try:
             await bot.send_message(chat_id, text, reply_markup=markup)
         except Exception:
-            logging.exception("Failed to send SubGram task prompt to chat_id=%s", chat_id)
+            logger.exception("Failed to send SubGram task prompt to chat_id=%s", chat_id)
         return True
 
     def _build_blocking_prompt(
         self, response: Dict[str, Any], status: Optional[str]
     ) -> Optional[tuple[str, Any]]:
         if status == "warning":
-            additional = response.get("additional") or {}
-            sponsors = additional.get("sponsors") or []
-            builder = InlineKeyboardBuilder()
-            tasks: list[str] = []
-            for sponsor in sponsors:
-                if not sponsor:
-                    continue
-                if not sponsor.get("available_now"):
-                    continue
-                if sponsor.get("status") != "unsubscribed":
-                    continue
-                link = sponsor.get("link")
-                if not link:
-                    continue
-                button_text = sponsor.get("button_text") or "Подписаться"
-                builder.button(text=button_text, url=link)
-                name = sponsor.get("resource_name") or button_text
-                tasks.append(name)
-
-            if not tasks:
-                return None
-
-            builder.button(text="✅ Я выполнил", callback_data="subgram-op")
-            builder.adjust(1)
-
-            task_lines = "\n".join(f"• {task}" for task in tasks)
-            text = (
-                "Чтобы продолжить, выполните задания:\n"
-                f"{task_lines}\n\nПосле выполнения нажмите «✅ Я выполнил»."
+            prompt = self._build_sponsor_prompt(response)
+            if prompt is not None:
+                return prompt
+            logger.info(
+                "SubGram warning status without sponsors | response=%s",
+                response,
             )
-            return text, builder.as_markup()
+            return None
 
         if status == "gender":
             builder = InlineKeyboardBuilder()
@@ -339,19 +357,89 @@ class SubgramCheckMiddleware(BaseMiddleware):
         if status == "register":
             additional = response.get("additional") or {}
             reg_url = additional.get("registration_url")
+            builder = InlineKeyboardBuilder()
+            if reg_url:
+                builder.button(
+                    text="✅ Пройти регистрацию",
+                    web_app=WebAppInfo(url=reg_url),
+                )
+            prompt = self._build_sponsor_prompt(
+                response,
+                builder=builder,
+                base_text=response.get("message")
+                or "Для продолжения, пожалуйста, пройдите быструю регистрацию.",
+            )
+            if prompt is not None:
+                return prompt
             if not reg_url:
                 return None
-            builder = InlineKeyboardBuilder()
-            builder.button(
-                text="✅ Пройти регистрацию",
-                web_app=WebAppInfo(url=reg_url),
-            )
             builder.button(text="Продолжить", callback_data="subgram-op")
             builder.adjust(1)
-            text = "Для продолжения, пожалуйста, пройдите быструю регистрацию."
+            text = response.get("message") or (
+                "Для продолжения, пожалуйста, пройдите быструю регистрацию."
+            )
             return text, builder.as_markup()
 
         return None
+
+    def _build_sponsor_prompt(
+        self,
+        response: Dict[str, Any],
+        *,
+        builder: Optional[InlineKeyboardBuilder] = None,
+        base_text: Optional[str] = None,
+    ) -> Optional[tuple[str, Any]]:
+        additional = response.get("additional") or {}
+        sponsors = additional.get("sponsors")
+        if not isinstance(sponsors, list):
+            return None
+
+        local_builder = builder or InlineKeyboardBuilder()
+        tasks: list[str] = []
+        for sponsor in sponsors:
+            if not isinstance(sponsor, dict):
+                continue
+            if not sponsor.get("available_now", True):
+                logger.debug(
+                    "Skipping unavailable sponsor | sponsor=%s", sponsor
+                )
+                continue
+            if sponsor.get("status") not in {None, "unsubscribed"}:
+                logger.debug(
+                    "Skipping sponsor due to status | sponsor=%s", sponsor
+                )
+                continue
+            link = sponsor.get("link")
+            if not link:
+                logger.debug(
+                    "Skipping sponsor without link | sponsor=%s", sponsor
+                )
+                continue
+            button_text = sponsor.get("button_text") or "Подписаться"
+            local_builder.button(text=button_text, url=link)
+            name = sponsor.get("resource_name") or button_text
+            tasks.append(name)
+
+        if not tasks:
+            return None
+
+        local_builder.button(text="✅ Я выполнил", callback_data="subgram-op")
+        local_builder.adjust(1)
+
+        message = base_text or response.get("message")
+        task_lines = "\n".join(f"• {task}" for task in tasks)
+        if message:
+            text = (
+                f"{message}\n\nЧтобы продолжить, выполните задания:\n{task_lines}\n\n"
+                "После выполнения нажмите «✅ Я выполнил»."
+            )
+        else:
+            text = (
+                "Чтобы продолжить, выполните задания:\n"
+                f"{task_lines}\n\nПосле выполнения нажмите «✅ Я выполнил»."
+            )
+
+        return text, local_builder.as_markup()
 
     def _extract_referred_by(
         self, event: TelegramObject, telegram_id: int
