@@ -45,6 +45,11 @@ class SubgramCheckMiddleware(BaseMiddleware):
     """Промежуточный слой, который проверяет пользователя через SubGram."""
 
     BLOCKING_STATUSES = {"warning", "gender", "age", "register"}
+    LANGUAGE_BLOCK_MESSAGES = {
+        "fa": "متأسفانه این ربات برای شما در دسترس نیست.",
+        "ar": "للأسف، هذا البوت غير متاح لك.",
+        "tr": "Maalesef bu bot size uygun değildir.",
+    }
 
     def __init__(self, client: SubgramClient) -> None:
         super().__init__()
@@ -75,6 +80,21 @@ class SubgramCheckMiddleware(BaseMiddleware):
             was_verified,
             self._is_subgram_callback(event),
         )
+
+        blocked_language_message = self._get_language_block_message(
+            getattr(user, "language_code", None)
+        )
+        if blocked_language_message is not None:
+            logger.info(
+                "SubGram language gating | user_id=%s chat_id=%s language_code=%s",
+                user.id,
+                chat_id,
+                getattr(user, "language_code", None),
+            )
+            await self._send_blocking_message(
+                bot, event, chat_id, blocked_language_message
+            )
+            return await self._maybe_call_subgram_handler(handler, event, data)
 
         if was_verified and not self._is_subgram_callback(event):
             return await handler(event, data)
@@ -335,6 +355,16 @@ class SubgramCheckMiddleware(BaseMiddleware):
         except Exception:
             logger.exception("Failed to send SubGram task prompt to chat_id=%s", chat_id)
         return True
+
+    def _get_language_block_message(self, language_code: Optional[str]) -> Optional[str]:
+        if not language_code:
+            return None
+
+        normalized = language_code.lower()
+        for prefix, message in self.LANGUAGE_BLOCK_MESSAGES.items():
+            if normalized.startswith(prefix):
+                return message
+        return None
 
     def _build_blocking_prompt(
         self, response: Dict[str, Any], status: Optional[str]
