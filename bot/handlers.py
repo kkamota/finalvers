@@ -355,6 +355,11 @@ async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
         return
     if not await ensure_subscription_access(message, bot, settings, user):
         return
+    if not getattr(user, "flyer_verified", False):
+        await message.answer(
+            "Получить ежедневный бонус можно после выполнения обязательных заданий."
+        )
+        return
     now = datetime.datetime.utcnow()
     last_bonus = None
     if user.last_daily_bonus:
