@@ -357,7 +357,7 @@ async def daily_bonus(message: Message, settings: Settings, bot: Bot) -> None:
         return
     if not getattr(user, "flyer_verified", False):
         await message.answer(
-            "Получить ежедневный бонус можно после выполнения заданий из SubGram."
+            "Получить ежедневный бонус можно после выполнения обязательных заданий."
         )
         return
     now = datetime.datetime.utcnow()

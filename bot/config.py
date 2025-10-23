@@ -9,6 +9,7 @@ class Settings:
     channel_username: str
     admin_ids: Sequence[int]
     subgram_api_key: str
+    flyer_api_key: str
     min_withdrawal: int = 15
     start_bonus: int = 3
     referral_bonus: int = 3
@@ -30,6 +31,10 @@ def load_settings() -> Settings:
         "SUBGRAM_API_KEY",
         "8f1d306a74aee60166624a41dde06af397c4161c2b1c72befd61472143077c5d",
     )
+    flyer_api_key = os.getenv(
+        "FLYER_API_KEY",
+        "FL-nDnAdz-lUODDB-jYqtsJ-neLImC",
+    )
     webhook_host = os.getenv("WEBHOOK_HOST", "5.8.18.37")
     webhook_port = int(os.getenv("WEBHOOK_PORT", "50000"))
 
@@ -38,6 +43,7 @@ def load_settings() -> Settings:
         channel_username=channel,
         admin_ids=admin_ids or (123456789,),
         subgram_api_key=subgram_api_key,
+        flyer_api_key=flyer_api_key,
         webhook_host=webhook_host,
         webhook_port=webhook_port,
     )

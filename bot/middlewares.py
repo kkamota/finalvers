@@ -8,6 +8,7 @@ from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message, TelegramObject, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from flyerapi import APIError, Flyer
 
 from .database import db
 from .subgram import SubgramClient
@@ -51,9 +52,13 @@ class SubgramCheckMiddleware(BaseMiddleware):
         "tr": "Maalesef bu bot size uygun değildir.",
     }
 
-    def __init__(self, client: SubgramClient) -> None:
+    def __init__(self, client: SubgramClient, *, flyer: Optional[Flyer] = None) -> None:
         super().__init__()
         self._client = client
+        self._flyer = flyer
+        self._flyer_message_template = {
+            "text": "Чтобы продолжить работу с ботом, выполните задания ниже.",
+        }
 
     async def __call__(
         self,
@@ -155,6 +160,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
             getattr(user_record, "referred_by", None) if user_record is not None else None
         )
 
+        flyer_allowed = True
         if response.get("code") == 404:
             if effective_referrer:
                 logger.warning(
@@ -175,6 +181,15 @@ class SubgramCheckMiddleware(BaseMiddleware):
                     user.id,
                     chat_id,
                 )
+            flyer_allowed = await self._handle_flyer_fallback(
+                bot,
+                event,
+                chat_id,
+                user.id,
+                getattr(user, "language_code", None),
+            )
+            if not flyer_allowed:
+                return await self._maybe_call_subgram_handler(handler, event, data)
         if status in self.BLOCKING_STATUSES:
             handled = await self._handle_blocking_status(bot, event, chat_id, response, status)
             if handled:
@@ -194,7 +209,7 @@ class SubgramCheckMiddleware(BaseMiddleware):
 
         await db.set_flyer_verified(user.id, True)
 
-        if not was_verified:
+        if not was_verified and flyer_allowed:
             await self._trigger_start(event, data)
 
         if self._is_subgram_callback(event):
@@ -203,6 +218,55 @@ class SubgramCheckMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         return await handler(event, data)
+
+    async def _handle_flyer_fallback(
+        self,
+        bot: Any,
+        event: TelegramObject,
+        chat_id: int,
+        user_id: int,
+        language_code: Optional[str],
+    ) -> bool:
+        if self._flyer is None:
+            logger.warning(
+                "SubGram 404 fallback requested but Flyer client is not configured | user_id=%s",
+                user_id,
+            )
+            return True
+
+        try:
+            is_allowed = await self._flyer.check(
+                user_id,
+                language_code=language_code,
+                message=dict(self._flyer_message_template),
+            )
+        except APIError:
+            logger.exception(
+                "Flyer API error during fallback verification | user_id=%s",
+                user_id,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Unexpected error during Flyer fallback verification | user_id=%s",
+                user_id,
+            )
+            return True
+
+        if is_allowed:
+            logger.info(
+                "Flyer fallback verification succeeded | user_id=%s chat_id=%s",
+                user_id,
+                chat_id,
+            )
+            return True
+
+        message_text = (
+            "К сожалению мы не можем удостовериться, что ваш аккаунт не фейковый. "
+            "Попробуйте позже или выполните задания, которые пришли вам отдельно."
+        )
+        await self._send_blocking_message(bot, event, chat_id, message_text)
+        return False
 
     async def _reward_referrer_for_fake_warning(
         self,
