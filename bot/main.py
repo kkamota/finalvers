@@ -7,12 +7,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 import uvicorn
 
-from flyerapi import Flyer
-
 from .config import Settings, load_settings
 from .database import db
 from .handlers import register_handlers
-from .middlewares import FlyerCheckMiddleware, ThrottlingMiddleware
+from .middlewares import SubgramCheckMiddleware, ThrottlingMiddleware
+from .subgram import SubgramClient
 from .webhook import create_app
 
 
@@ -30,14 +29,20 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    flyer = Flyer(settings.flyer_api_key)
+
+    subgram_client = SubgramClient(settings.subgram_api_key)
 
     dp = Dispatcher()
-    dp.workflow_data.update(settings=settings, flyer=flyer)
+    dp.workflow_data.update(settings=settings, subgram_client=subgram_client)
 
-    dp.message.middleware(FlyerCheckMiddleware(flyer))
-    dp.callback_query.middleware(FlyerCheckMiddleware(flyer))
+    dp.message.middleware(SubgramCheckMiddleware(subgram_client))
+    dp.callback_query.middleware(SubgramCheckMiddleware(subgram_client))
     dp.message.middleware(ThrottlingMiddleware(rate_limit=0.5))
+
+    async def _close_subgram_client() -> None:
+        await subgram_client.close()
+
+    dp.shutdown.register(_close_subgram_client)
 
     register_handlers(dp)
 
