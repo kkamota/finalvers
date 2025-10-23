@@ -5,10 +5,14 @@ from contextlib import suppress
 from typing import Any, Callable, Dict, Optional
 
 from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject
-from flyerapi import APIError, Flyer
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery, Message, TelegramObject, WebAppInfo
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .database import db
+from .subgram import SubgramClient
+
+logger = logging.getLogger(__name__)
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -37,13 +41,14 @@ class ThrottlingMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-class FlyerCheckMiddleware(BaseMiddleware):
-    def __init__(self, flyer: Flyer, *, message_template: Optional[Dict[str, str]] = None) -> None:
+class SubgramCheckMiddleware(BaseMiddleware):
+    """Промежуточный слой, который проверяет пользователя через SubGram."""
+
+    BLOCKING_STATUSES = {"warning", "gender", "age", "register"}
+
+    def __init__(self, client: SubgramClient) -> None:
         super().__init__()
-        self.flyer = flyer
-        self._message_template = message_template or {
-            "text": "Чтобы продолжить работу с ботом, выполните задания ниже.",
-        }
+        self._client = client
 
     async def __call__(
         self,
@@ -52,75 +57,146 @@ class FlyerCheckMiddleware(BaseMiddleware):
         data: Dict[str, Any],
     ) -> Any:
         user = data.get("event_from_user")
-        if user is None:
+        bot = data.get("bot")
+        if user is None or bot is None:
             return await handler(event, data)
 
-        language_code = getattr(user, "language_code", None)
-        message_payload = dict(self._message_template)
+        chat_id = self._resolve_chat_id(event)
+        if chat_id is None:
+            return await handler(event, data)
 
         user_record = await db.get_user(user.id)
+        was_verified = bool(user_record and getattr(user_record, "flyer_verified", 0))
+
+        logger.info(
+            "SubGram middleware invoked | user_id=%s chat_id=%s was_verified=%s is_callback=%s",
+            user.id,
+            chat_id,
+            was_verified,
+            self._is_subgram_callback(event),
+        )
+
+        if was_verified and not self._is_subgram_callback(event):
+            return await handler(event, data)
+
         referred_by = self._extract_referred_by(event, user.id)
         username = getattr(user, "username", None)
-        if user_record and getattr(user_record, "flyer_verified", 0):
+
+        if was_verified and self._is_subgram_callback(event):
+            await self._acknowledge_callback(event)
+            await self._cleanup_callback_message(event)
             return await handler(event, data)
 
-        was_verified = bool(getattr(user_record, "flyer_verified", 0)) if user_record else False
+        await self._remember_user_context(user.id, username, referred_by, user_record)
 
+        extra_params = self._extract_additional_parameters(event)
+        user_payload: Dict[str, Any] = {
+            "first_name": getattr(user, "first_name", None),
+            "username": username,
+            "language_code": getattr(user, "language_code", None),
+        }
+        is_premium = getattr(user, "is_premium", None)
+        if is_premium is not None:
+            user_payload["is_premium"] = bool(is_premium)
+        user_payload.update(extra_params)
 
-        try:
-            is_allowed = await self.flyer.check(
-                user.id,
-                language_code=language_code,
-                message=message_payload,
+        user_payload.setdefault("action", "subscribe")
+
+        response = await self._client.get_sponsors(
+            user_id=user.id,
+            chat_id=chat_id,
+            **user_payload,
+        )
+
+        if response is None:
+            logger.warning(
+                "SubGram response missing | user_id=%s chat_id=%s", user.id, chat_id
             )
-        except APIError:
-            logging.exception("Flyer API returned an error during check")
-            return await handler(event, data)
-        except Exception:
-            logging.exception("Unexpected error during Flyer verification")
-            return await handler(event, data)
-
-        if not is_allowed:
-            await self._remember_user_context(
-                user.id,
-                username,
-                referred_by,
-                user_record,
+            await self._send_blocking_message(
+                bot,
+                event,
+                chat_id,
+                (
+                    "Не удалось проверить выполнение заданий. "
+                    "Повторите попытку позже."
+                ),
             )
-            await self._notify_verification_required(event)
-            return None
+            return await self._maybe_call_subgram_handler(handler, event, data)
 
-        if user_record is None:
-            await db.create_user(
+        status = response.get("status")
+        logger.info(
+            "SubGram status resolved | user_id=%s chat_id=%s status=%s message=%s",
+            user.id,
+            chat_id,
+            status,
+            response.get("message"),
+        )
+        if response.get("code") == 404:
+            logger.warning(
+                "SubGram flagged potential fake account | user_id=%s chat_id=%s response=%s",
                 user.id,
-                0,
-                referred_by,
-                username,
+                chat_id,
+                response,
             )
-        else:
-            if (
-                referred_by is not None
-                and referred_by != user.id
-                and user_record.referred_by is None
-            ):
-                await db.assign_referrer(user.id, referred_by)
-                with suppress(AttributeError):
-                    user_record.referred_by = referred_by
-            if username is not None and username != user_record.username:
-                await db.update_username(user.id, username)
-                with suppress(AttributeError):
-                    user_record.username = username
+            await self._send_blocking_message(
+                bot,
+                event,
+                chat_id,
+                (
+                    "К сожалению, мы не можем удостовериться, что ваш аккаунт не фейковый. "
+                    "Попробуйте позже."
+                ),
+            )
+            return await self._maybe_call_subgram_handler(handler, event, data)
+        if status in self.BLOCKING_STATUSES:
+            handled = await self._handle_blocking_status(bot, event, chat_id, response, status)
+            if handled:
+                return None
+            status = "ok"
+
+        if status == "error":
+            logger.warning("SubGram API responded with error: %s", response)
+            await self._send_blocking_message(
+                bot,
+                event,
+                chat_id,
+                response.get("message")
+                or "Ошибка при проверке заданий. Попробуйте еще раз позже.",
+            )
+            return await self._maybe_call_subgram_handler(handler, event, data)
+
         await db.set_flyer_verified(user.id, True)
 
         if not was_verified:
             await self._trigger_start(event, data)
 
+        if self._is_subgram_callback(event):
+            await self._acknowledge_callback(event)
+            await self._cleanup_callback_message(event)
+            return await handler(event, data)
+
         return await handler(event, data)
 
-    async def _notify_verification_required(self, event: TelegramObject) -> None:
-        if isinstance(event, CallbackQuery):
-            with suppress(Exception):
-                await event.answer()
+    async def _handle_blocking_status(
+        self,
+        bot: Any,
+        event: TelegramObject,
+        chat_id: int,
+        response: Dict[str, Any],
+        status: Optional[str],
+    ) -> bool:
+        prompt = self._build_blocking_prompt(response, status)
+        if prompt is None:
+            text = "Выполните обязательные задания, чтобы продолжить пользоваться ботом."
+            logger.warning(
+                "SubGram blocking status without prompt | status=%s response=%s",
+                status,
+                response,
+            )
+            return await self._send_blocking_message(bot, event, chat_id, text)
+
+        text, markup = prompt
+        return await self._send_blocking_message(bot, event, chat_id, text, markup)
 
     async def _remember_user_context(
         self,
@@ -130,10 +206,21 @@ class FlyerCheckMiddleware(BaseMiddleware):
         user_record: Optional[Any],
     ) -> None:
         if user_record is None:
+            logger.info(
+                "SubGram remember context | created user_id=%s referred_by=%s",
+                telegram_id,
+                referred_by,
+            )
             await db.create_user(telegram_id, 0, referred_by, username)
             return
 
         if username is not None and username != user_record.username:
+            logger.info(
+                "SubGram remember context | updating username user_id=%s old=%s new=%s",
+                telegram_id,
+                getattr(user_record, "username", None),
+                username,
+            )
             await db.update_username(telegram_id, username)
             with suppress(AttributeError):
                 user_record.username = username
@@ -143,9 +230,25 @@ class FlyerCheckMiddleware(BaseMiddleware):
             and referred_by != telegram_id
             and user_record.referred_by is None
         ):
+            logger.info(
+                "SubGram remember context | assigning referrer user_id=%s ref=%s",
+                telegram_id,
+                referred_by,
+            )
             await db.assign_referrer(telegram_id, referred_by)
             with suppress(AttributeError):
                 user_record.referred_by = referred_by
+
+    def _extract_additional_parameters(self, event: TelegramObject) -> Dict[str, Any]:
+        if not isinstance(event, CallbackQuery) or not event.data:
+            return {}
+
+        data = event.data
+        if data.startswith("subgram_gender_"):
+            return {"gender": data.split("_")[2]}
+        if data.startswith("subgram_age_"):
+            return {"age": data.split("_")[2]}
+        return {}
 
     async def _trigger_start(
         self, event: TelegramObject, data: Dict[str, Any]
@@ -183,6 +286,177 @@ class FlyerCheckMiddleware(BaseMiddleware):
                 getattr(user, "username", None),
                 message=trigger_message,
             )
+
+    def _resolve_chat_id(self, event: TelegramObject) -> Optional[int]:
+        if isinstance(event, Message):
+            return event.chat.id
+        if isinstance(event, CallbackQuery) and event.message:
+            return event.message.chat.id
+        return None
+
+    def _is_subgram_callback(self, event: TelegramObject) -> bool:
+        return isinstance(event, CallbackQuery) and bool(event.data and event.data.startswith("subgram"))
+
+    async def _acknowledge_callback(self, event: CallbackQuery) -> None:
+        text = "⏳ Проверяем задания..." if event.data == "subgram-op" else None
+        with suppress(Exception):
+            await event.answer(text)
+
+    async def _cleanup_callback_message(self, event: TelegramObject) -> None:
+        if not isinstance(event, CallbackQuery) or event.message is None:
+            return
+        with suppress(TelegramBadRequest):
+            await event.message.delete()
+
+    async def _maybe_call_subgram_handler(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Any],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        if self._is_subgram_callback(event):
+            return await handler(event, data)
+        return None
+
+    async def _send_blocking_message(
+        self,
+        bot: Any,
+        event: TelegramObject,
+        chat_id: int,
+        text: str,
+        markup: Optional[Any] = None,
+    ) -> bool:
+        if self._is_subgram_callback(event):
+            await self._acknowledge_callback(event)
+            await self._cleanup_callback_message(event)
+
+        try:
+            await bot.send_message(chat_id, text, reply_markup=markup)
+        except Exception:
+            logger.exception("Failed to send SubGram task prompt to chat_id=%s", chat_id)
+        return True
+
+    def _build_blocking_prompt(
+        self, response: Dict[str, Any], status: Optional[str]
+    ) -> Optional[tuple[str, Any]]:
+        if status == "warning":
+            prompt = self._build_sponsor_prompt(response)
+            if prompt is not None:
+                return prompt
+            logger.info(
+                "SubGram warning status without sponsors | response=%s",
+                response,
+            )
+            return None
+
+        if status == "gender":
+            builder = InlineKeyboardBuilder()
+            builder.button(text="Мужской", callback_data="subgram_gender_male")
+            builder.button(text="Женский", callback_data="subgram_gender_female")
+            builder.adjust(2)
+            return "Укажите ваш пол:", builder.as_markup()
+
+        if status == "age":
+            builder = InlineKeyboardBuilder()
+            age_categories = {
+                "c1": "Младше 10",
+                "c2": "11-13",
+                "c3": "14-15",
+                "c4": "16-17",
+                "c5": "18-24",
+                "c6": "25 и старше",
+            }
+            for code, label in age_categories.items():
+                builder.button(text=label, callback_data=f"subgram_age_{code}")
+            builder.adjust(2)
+            return "Укажите ваш возраст:", builder.as_markup()
+
+        if status == "register":
+            additional = response.get("additional") or {}
+            reg_url = additional.get("registration_url")
+            builder = InlineKeyboardBuilder()
+            if reg_url:
+                builder.button(
+                    text="✅ Пройти регистрацию",
+                    web_app=WebAppInfo(url=reg_url),
+                )
+            prompt = self._build_sponsor_prompt(
+                response,
+                builder=builder,
+                base_text=response.get("message")
+                or "Для продолжения, пожалуйста, пройдите быструю регистрацию.",
+            )
+            if prompt is not None:
+                return prompt
+            if not reg_url:
+                return None
+            builder.button(text="Продолжить", callback_data="subgram-op")
+            builder.adjust(1)
+            text = response.get("message") or (
+                "Для продолжения, пожалуйста, пройдите быструю регистрацию."
+            )
+            return text, builder.as_markup()
+
+        return None
+
+    def _build_sponsor_prompt(
+        self,
+        response: Dict[str, Any],
+        *,
+        builder: Optional[InlineKeyboardBuilder] = None,
+        base_text: Optional[str] = None,
+    ) -> Optional[tuple[str, Any]]:
+        additional = response.get("additional") or {}
+        sponsors = additional.get("sponsors")
+        if not isinstance(sponsors, list):
+            return None
+
+        local_builder = builder or InlineKeyboardBuilder()
+        tasks: list[str] = []
+        for sponsor in sponsors:
+            if not isinstance(sponsor, dict):
+                continue
+            if not sponsor.get("available_now", True):
+                logger.debug(
+                    "Skipping unavailable sponsor | sponsor=%s", sponsor
+                )
+                continue
+            if sponsor.get("status") not in {None, "unsubscribed"}:
+                logger.debug(
+                    "Skipping sponsor due to status | sponsor=%s", sponsor
+                )
+                continue
+            link = sponsor.get("link")
+            if not link:
+                logger.debug(
+                    "Skipping sponsor without link | sponsor=%s", sponsor
+                )
+                continue
+            button_text = sponsor.get("button_text") or "Подписаться"
+            local_builder.button(text=button_text, url=link)
+            name = sponsor.get("resource_name") or button_text
+            tasks.append(name)
+
+        if not tasks:
+            return None
+
+        local_builder.button(text="✅ Я выполнил", callback_data="subgram-op")
+        local_builder.adjust(1)
+
+        message = base_text or response.get("message")
+        task_lines = "\n".join(f"• {task}" for task in tasks)
+        if message:
+            text = (
+                f"{message}\n\nЧтобы продолжить, выполните задания:\n{task_lines}\n\n"
+                "После выполнения нажмите «✅ Я выполнил»."
+            )
+        else:
+            text = (
+                "Чтобы продолжить, выполните задания:\n"
+                f"{task_lines}\n\nПосле выполнения нажмите «✅ Я выполнил»."
+            )
+
+        return text, local_builder.as_markup()
 
     def _extract_referred_by(
         self, event: TelegramObject, telegram_id: int
